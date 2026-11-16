@@ -1,0 +1,637 @@
+import os
+import random
+import pickle
+import logging
+import subprocess
+from collections import deque, defaultdict
+
+import networkx as nx
+import numpy as np
+import pandas as pd
+import javalang
+
+from temporal_config import get_cutoff, resolve_cutoff_commit, write_cutoff_marker
+
+
+class InfoFilter(logging.Filter):
+    def filter(self, record): return record.levelno == logging.INFO
+
+
+logger = logging.getLogger('ccn_calculator')
+logger.setLevel(logging.INFO)
+logger.propagate = False
+EXPORT_DIR = "ExportFiles"
+os.makedirs(EXPORT_DIR, exist_ok=True)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.addFilter(InfoFilter())
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+file_handler = logging.FileHandler(os.path.join(EXPORT_DIR, 'ccn_error_log.txt'), encoding='utf-8')
+file_handler.setLevel(logging.WARNING)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.handlers = []
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
+
+
+class git_snapshot_at:
+    """Context manager: check out the last commit at/before `cutoff_date`, then restore the original ref.
+
+    The original HEAD/branch is restored even if an exception occurs. If cutoff_date is None, it is a no-op.
+    """
+
+    def __init__(self, code_dir, cutoff_date):
+        self.code_dir = code_dir
+        self.cutoff_date = cutoff_date
+        self._original_ref = None
+        self._commit_at_cutoff = None
+        self._active = cutoff_date is not None
+
+    def _run(self, *args):
+        result = subprocess.run(
+            ["git", "-C", self.code_dir, *args],
+            capture_output=True, text=True, check=True
+        )
+        return result.stdout.strip()
+
+    def __enter__(self):
+        if not self._active:
+            logger.info(f"[{self.code_dir}] git_snapshot_at: no TEMPORAL_CUTOFF_DATE set, using repo as-is (HEAD).")
+            return self
+
+        branch = self._run("rev-parse", "--abbrev-ref", "HEAD")
+        self._original_ref = branch if branch != "HEAD" else self._run("rev-parse", "HEAD")
+
+        status = self._run("status", "--porcelain")
+        if status:
+            raise RuntimeError(
+                f"[{self.code_dir}] git_snapshot_at: working tree has uncommitted changes. "
+                f"Commit, stash, or clean before running - refusing to check out over "
+                f"uncommitted work."
+            )
+
+        # Same anchor definition as scripts 1 and 3
+        self._commit_at_cutoff = resolve_cutoff_commit(self.code_dir, self.cutoff_date, "HEAD")
+        if not self._commit_at_cutoff:
+            raise RuntimeError(
+                f"[{self.code_dir}] git_snapshot_at: no commit found at or before "
+                f"{self.cutoff_date}. Check TEMPORAL_CUTOFF_DATE against this project's "
+                f"actual commit history."
+            )
+
+        logger.info(f"[{self.code_dir}] git_snapshot_at: checking out commit {self._commit_at_cutoff} "
+                    f"(last commit at/before {self.cutoff_date}); was on '{self._original_ref}'.")
+        self._run("checkout", "--detach", self._commit_at_cutoff)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self._active:
+            return False
+        logger.info(f"[{self.code_dir}] git_snapshot_at: restoring original ref '{self._original_ref}'.")
+        self._run("checkout", self._original_ref)
+        return False
+
+    @property
+    def commit_hash(self):
+        return self._commit_at_cutoff
+
+
+JAVA_STD_LIB_PREFIXES = ("java.", "javax.", "sun.")
+
+# ====================== Settings ======================
+# Final edge weight = ALPHA_STRUCTURAL * structural + (1 - ALPHA_STRUCTURAL) * co-change (both normalized).
+# Without co_change_counts.pkl, only the structural weight is used.
+ALPHA_STRUCTURAL = 0.6
+# If True, the full pipeline also runs once per alpha in ALPHA_SENSITIVITY_GRID (extra runtime)
+RUN_ALPHA_SENSITIVITY = True
+
+BASE_CODE_DIR = r"D:\proje\python\Payannameh\Source"
+PROJECTS = ["spring-framework", "elasticsearch", "hadoop"]
+# ======================================================
+
+
+def normalize_weights_robust(raw_values, clip_percentile=99, logger_=None, label=""):
+    """Robust normalization: log1p, then cap at a high percentile instead of the raw max.
+
+    Prevents a few outliers from pushing all other values toward zero.
+    Returns (cap, log1p_values_array).
+    """
+    arr = np.asarray(list(raw_values), dtype=float)
+    if arr.size == 0:
+        return 1.0, arr
+    log_arr = np.log1p(arr)
+    cap = float(np.percentile(log_arr, clip_percentile))
+    if cap <= 0:
+        cap = float(log_arr.max()) if log_arr.max() > 0 else 1.0
+    if logger_ is not None:
+        raw_max = float(arr.max())
+        logger_.info(
+            f"[{label}] robust normalization: raw_max={raw_max:.2f}, "
+            f"log1p_p{clip_percentile}_cap={cap:.4f}, "
+            f"share_of_raw_values_at_or_above_cap-equivalent="
+            f"{(log_arr >= cap).mean():.2%}"
+        )
+    return cap, log_arr
+
+
+def log_distribution(values, logger_, label):
+    """Log count/min/median/mean/p95/max/CV of numeric values."""
+    arr = np.asarray(list(values), dtype=float)
+    if arr.size == 0:
+        logger_.warning(f"[{label}] distribution: no values to summarize.")
+        return
+    mean = arr.mean()
+    cv = (arr.std() / mean) if mean > 0 else float("nan")
+    logger_.info(
+        f"[{label}] distribution: n={arr.size}  min={arr.min():.5f}  "
+        f"median={np.median(arr):.5f}  mean={mean:.5f}  "
+        f"p95={np.percentile(arr, 95):.5f}  max={arr.max():.5f}  "
+        f"std={arr.std():.5f}  CV={cv:.3f}  "
+        f"share_below_0.05={(arr < 0.05).mean():.2%}"
+    )
+
+
+def get_fqn_from_path(file_path, repo_root):
+    """Path-based fully-qualified class identity (package.ClassName), the graph's node identity."""
+    try:
+        rel_path = os.path.relpath(file_path, repo_root)
+        if not rel_path.endswith(".java"):
+            return None
+        return rel_path.replace(os.sep, '.').replace('/', '.')[:-5]
+    except Exception:
+        return None
+
+
+def build_simple_name_index(code_dir):
+    """Map each simple class name to the list of FQNs sharing it (built from file paths only)."""
+    index = defaultdict(list)
+    for root, _, files in os.walk(code_dir):
+        for file in files:
+            if file.endswith(".java"):
+                fqn = get_fqn_from_path(os.path.join(root, file), code_dir)
+                if fqn:
+                    index[fqn.split('.')[-1]].append(fqn)
+    return index
+
+
+def resolve_dependency_identity(dep_simple_name, import_map, simple_name_index):
+    """Resolve a simple type name to an unambiguous identity.
+
+    Order: exact import match -> unique in-repo simple name -> 'EXTERNAL::<name>'
+    (external or ambiguous; never collides with an in-repo node).
+    """
+    if dep_simple_name in import_map:
+        return import_map[dep_simple_name]
+    candidates = simple_name_index.get(dep_simple_name)
+    if candidates and len(candidates) == 1:
+        return candidates[0]
+    return f"EXTERNAL::{dep_simple_name}"
+
+
+def extract_dependencies_javalang(file_path, repo_root, simple_name_index):
+    dependencies = defaultdict(int)
+    class_name = None  # simple name, only used to find the primary type in this file's AST
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
+        tree = javalang.parse.parse(content)
+        for _, node in tree.filter(javalang.tree.TypeDeclaration):
+            if isinstance(node, (javalang.tree.ClassDeclaration, javalang.tree.InterfaceDeclaration)):
+                class_name = node.name
+                break
+        if not class_name: return None, {}
+
+        # simple name -> fully-qualified import path
+        import_map = {}
+        try:
+            for imp in tree.imports:
+                if imp.path:
+                    import_map[imp.path.split('.')[-1]] = imp.path
+        except Exception:
+            pass
+
+        for _, node in tree:
+            dep_name = None
+            weight = 1
+            if isinstance(node, javalang.tree.ClassDeclaration) and node.extends:
+                if hasattr(node.extends, 'name'): dep_name = node.extends.name; weight = 3
+            elif isinstance(node, javalang.tree.ClassDeclaration) and node.implements:
+                for impl in node.implements:
+                    if hasattr(impl, 'name'): dependencies[impl.name] += 3
+            elif isinstance(node, javalang.tree.FieldDeclaration):
+                if hasattr(node.type, 'name'): dep_name = node.type.name
+                if hasattr(node.type, 'arguments') and node.type.arguments:
+                    for arg in node.type.arguments:
+                        if isinstance(arg.type, javalang.tree.ReferenceType) and hasattr(arg.type, 'name'):
+                            dependencies[arg.type.name] += 1
+            elif isinstance(node, javalang.tree.MethodDeclaration) and node.return_type:
+                if hasattr(node.return_type, 'name'): dep_name = node.return_type.name
+                if hasattr(node.return_type, 'arguments') and node.return_type.arguments:
+                    for arg in node.return_type.arguments:
+                        if isinstance(arg.type, javalang.tree.ReferenceType) and hasattr(arg.type, 'name'):
+                            dependencies[arg.type.name] += 1
+            elif isinstance(node, javalang.tree.FormalParameter):
+                if hasattr(node.type, 'name'): dep_name = node.type.name
+                if hasattr(node.type, 'arguments') and node.type.arguments:
+                    for arg in node.type.arguments:
+                        if isinstance(arg.type, javalang.tree.ReferenceType) and hasattr(arg.type, 'name'):
+                            dependencies[arg.type.name] += 1
+            elif isinstance(node, javalang.tree.VariableDeclaration):
+                if hasattr(node.type, 'name'): dependencies[node.type.name] += 1
+                if hasattr(node.type, 'arguments') and node.type.arguments:
+                    for arg in node.type.arguments:
+                        if isinstance(arg.type, javalang.tree.ReferenceType) and hasattr(arg.type, 'name'):
+                            dependencies[arg.type.name] += 1
+                for declarator in node.declarators:
+                    if isinstance(declarator.initializer, javalang.tree.ClassCreator):
+                        if hasattr(declarator.initializer.type, 'name'):
+                            dependencies[declarator.initializer.type.name] += 2
+                        if hasattr(declarator.initializer.type, 'arguments') and declarator.initializer.type.arguments:
+                            for arg in declarator.initializer.type.arguments:
+                                if isinstance(arg.type, javalang.tree.ReferenceType) and hasattr(arg.type, 'name'):
+                                    dependencies[arg.type.name] += 1
+            if dep_name: dependencies[dep_name] += weight
+    except FileNotFoundError:
+        logger.warning(f"File not found: {file_path}")
+        return None, {}
+    except javalang.tokenizer.LexerError as e:
+        logger.warning(f"LexerError in processing {file_path}: {str(e)}")
+        return None, {}
+    except Exception as e:
+        logger.error(f"Error in processing file {file_path}: {type(e).__name__} - {str(e)}")
+        return None, {}
+    primitives = {'byte', 'short', 'int', 'long', 'float', 'double', 'boolean', 'char', 'void', 'String'}
+
+    subject_fqn = get_fqn_from_path(file_path, repo_root)
+    if not subject_fqn:
+        return None, {}
+
+    filtered_deps = {}
+    for dep, count in dependencies.items():
+        if not dep or dep == class_name or dep in primitives:
+            continue
+        resolved = resolve_dependency_identity(dep, import_map, simple_name_index)
+        filtered_deps[resolved] = filtered_deps.get(resolved, 0) + count
+
+    return subject_fqn, filtered_deps
+
+
+def build_ccn(code_dir, project_name):
+    graph = nx.DiGraph()
+    logger.info("Starting CCN construction...")
+    file_count = 0
+    processed_files = 0
+    project_dir = os.path.join(EXPORT_DIR, project_name)
+    os.makedirs(project_dir, exist_ok=True)
+
+    logger.info("Building project-wide simple-name index for entity resolution...")
+    simple_name_index = build_simple_name_index(code_dir)
+    ambiguous_names = {k: v for k, v in simple_name_index.items() if len(v) > 1}
+    if ambiguous_names:
+        logger.warning(
+            f"{len(ambiguous_names)} simple class names are ambiguous in this repo "
+            f"(same simple name reused across multiple packages). These are only "
+            f"resolved to a specific class via import statements; otherwise they are "
+            f"tagged as external/unresolved rather than silently merged together "
+            f"(previously they WOULD have been merged - see Stage-1 entity-resolution fix)."
+        )
+
+    for root, _, files in os.walk(code_dir):
+        java_files = [f for f in files if f.endswith(".java")]
+        file_count += len(java_files)
+        for file in java_files:
+            file_path = os.path.join(root, file)
+            class_name, deps = extract_dependencies_javalang(file_path, code_dir, simple_name_index)
+            if class_name:
+                processed_files += 1
+                if not graph.has_node(class_name): graph.add_node(class_name)
+                for dep, count in deps.items():
+                    # Skip external/ambiguous references: they have no metrics or history
+                    if dep.startswith("EXTERNAL::") or dep.startswith(JAVA_STD_LIB_PREFIXES):
+                        continue
+                    if not graph.has_node(dep): graph.add_node(dep)
+                    graph.add_edge(class_name, dep, weight=count)
+            if processed_files % 500 == 0 and processed_files > 0:
+                logger.info(f"Processed {processed_files}/{file_count} Java files...")
+    logger.info(f"Processed {processed_files} Java files completed.")
+    logger.info(f"Initial graph built with {graph.number_of_nodes()} nodes and {graph.number_of_edges()} edges.")
+    isolated_nodes = list(nx.isolates(graph))
+    if isolated_nodes:
+        graph.remove_nodes_from(isolated_nodes)
+        logger.info(f"{len(isolated_nodes)} isolated nodes removed.")
+    logger.info(f"Final graph with {graph.number_of_nodes()} nodes and {graph.number_of_edges()} edges.")
+    if graph.number_of_edges() == 0:
+        logger.warning("Graph has no edges.")
+    else:
+        try:
+            edges_list = list(graph.edges(data=True))
+            all_weights = [d['weight'] for _, _, d in edges_list]
+            if all_weights:
+                log_distribution(all_weights, logger, "raw_structural_weight (pre-normalization)")
+
+                if max(all_weights) > 0:
+                    cap, log_weights = normalize_weights_robust(
+                        all_weights, clip_percentile=99, logger_=logger, label="structural_weight"
+                    )
+                    for (u, v, d), lw in zip(edges_list, log_weights):
+                        # Keep the structural weight separate for later combination with the behavioral weight
+                        d['structural_weight'] = float(np.clip(lw / cap, 0, 1))
+                        d['weight'] = d['structural_weight']
+
+                    log_distribution(
+                        [d['structural_weight'] for _, _, d in graph.edges(data=True)],
+                        logger, "structural_weight (post log1p+p99 normalization)"
+                    )
+                else:
+                    logger.warning("Maximum edge weight is zero, normalization skipped.")
+            else:
+                logger.warning("No weights found in edges, normalization skipped.")
+        except Exception as e:
+            logger.error(f"Error in normalizing weights: {e}")
+    size_metrics = {}
+    size_metrics['num_components'] = graph.number_of_nodes()
+    size_metrics['num_connections'] = graph.number_of_edges()
+    size_metrics['density'] = nx.density(graph)
+    try:
+        size_metrics['diameter'] = nx.diameter(graph.to_undirected())
+    except nx.NetworkXError:
+        size_metrics['diameter'] = None
+        logger.info("Graph is not connected; diameter set to None.")
+    logger.info(f"Architecture size metrics: components={size_metrics['num_components']}, connections={size_metrics['num_connections']}, density={size_metrics['density']:.4f}, diameter={size_metrics['diameter']}")
+    size_metrics_file = os.path.join(project_dir, "size_metrics.pkl")
+    with open(size_metrics_file, "wb") as f: pickle.dump(size_metrics, f)
+    logger.info(f"Size metrics saved to '{size_metrics_file}'.")
+    return graph
+
+
+def load_cochange_counts(project_dir):
+    """Load cochange_counts ({(class_a, class_b): count}) from co_change_counts.pkl.
+
+    Returns None if the file is missing, empty or unreadable (structural weight only).
+    """
+    cochange_file = os.path.join(project_dir, "co_change_counts.pkl")
+    if not os.path.exists(cochange_file):
+        logger.warning(
+            f"File '{cochange_file}' not found. Behavioral weight will not be combined; only the structural weight will be used. "
+            f"To enable the behavioral weight, first run the co-change extraction script."
+        )
+        return None
+    try:
+        with open(cochange_file, "rb") as f:
+            data = pickle.load(f)
+        cochange_counts = data.get("cochange_counts", {})
+        if not cochange_counts:
+            logger.warning("The co_change_counts.pkl file is empty. Only the structural weight will be used.")
+            return None
+        logger.info(f"Co-change data loaded with {len(cochange_counts)} class pairs.")
+        return cochange_counts
+    except Exception as e:
+        logger.error(f"Error reading co_change_counts.pkl: {e}. Only the structural weight will be used.")
+        return None
+
+
+def combine_structural_and_behavioral_weights(graph, cochange_counts, alpha=ALPHA_STRUCTURAL):
+    """Set each edge weight to alpha * structural + (1 - alpha) * normalized co-change weight.
+
+    Without cochange_counts, the structural weight is kept as the final weight.
+    """
+    if not cochange_counts:
+        for u, v, d in graph.edges(data=True):
+            d.setdefault('structural_weight', d.get('weight', 0.0))
+            d['behavioral_weight'] = 0.0
+        return graph
+
+    log_distribution(cochange_counts.values(), logger, "raw_cochange_counts (all pairs, pre-normalization)")
+
+    cap, _ = normalize_weights_robust(
+        cochange_counts.values(), clip_percentile=99, logger_=logger, label="behavioral_weight"
+    ) if cochange_counts else (1.0, np.array([]))
+    matched_edges = 0
+
+    behavioral_weights_for_log = []
+    for u, v, d in graph.edges(data=True):
+        structural_weight = d.get('structural_weight', d.get('weight', 0.0))
+        pair_key = (u, v) if u <= v else (v, u)
+        raw_cochange = cochange_counts.get(pair_key, 0)
+        behavioral_weight = float(np.clip(np.log1p(raw_cochange) / cap, 0, 1)) if cap > 0 else 0.0
+        if raw_cochange > 0:
+            matched_edges += 1
+
+        d['structural_weight'] = structural_weight
+        d['behavioral_weight'] = behavioral_weight
+        d['weight'] = alpha * structural_weight + (1 - alpha) * behavioral_weight
+        behavioral_weights_for_log.append(behavioral_weight)
+
+    logger.info(
+        f"Co-change behavioral weight found and combined for {matched_edges} of {graph.number_of_edges()} edges "
+        f"(ALPHA_STRUCTURAL={alpha}, behavioral weight={1 - alpha:.2f})."
+    )
+    log_distribution(behavioral_weights_for_log, logger, "behavioral_weight (post log1p+p99 normalization, matched to graph edges)")
+    log_distribution([d['weight'] for _, _, d in graph.edges(data=True)], logger, "FINAL combined edge weight (structural+behavioral)")
+    return graph
+
+
+def simulate_change_propagation(graph, base_simulations=50000, factor=10 , seed=42):
+    if not graph or graph.number_of_nodes() == 0:
+        logger.warning("Graph is empty or has no nodes. Simulation stopped.")
+        return defaultdict(float)
+    rng = random.Random(seed)
+    num_nodes = graph.number_of_nodes()
+    num_simulations = base_simulations + factor * num_nodes
+    logger.info(f"Starting simulation with {num_simulations} iterations for {num_nodes} nodes...")
+    propagation_counts = defaultdict(float)
+    nodes_list = list(graph.nodes)
+    for i in range(num_simulations):
+        if not nodes_list:
+            logger.warning("Node list is empty, simulation stopped.")
+            break
+        initial_class = rng.choice(nodes_list)
+        changed = {initial_class}
+        queue = deque([initial_class])
+        while queue:
+            current = queue.popleft()
+            if current not in graph: continue
+            for neighbor in graph.predecessors(current):
+                if neighbor not in changed and graph.has_edge(neighbor, current):
+                    edge_data = graph.get_edge_data(neighbor, current)
+                    if edge_data and 'weight' in edge_data:
+                        if rng.random() <= edge_data['weight']:
+                            changed.add(neighbor)
+                            queue.append(neighbor)
+        for cls in changed: propagation_counts[cls] += 1.0
+        if (i + 1) % (num_simulations // 10) == 0:
+            logger.info(f"Simulation progress: {(i + 1) / num_simulations:.0%}")
+    logger.info("Normalizing propagation counts to frequencies...")
+    propagation_frequencies = defaultdict(float)
+    if num_simulations > 0:
+        for cls, count in propagation_counts.items():
+            propagation_frequencies[cls] = count / num_simulations
+    logger.info(f"Simulation completed. Propagation frequencies calculated for {len(propagation_frequencies)} classes.")
+    # A low CV with values near 1/num_nodes means propagation barely spreads (weak feature signal)
+    log_distribution(propagation_frequencies.values(), logger, "FINAL propagation_frequency (this is what feeds the model)")
+    logger.info(f"For reference, uniform/no-propagation baseline would be ~{1.0 / max(num_nodes, 1):.5f} per class.")
+    return propagation_frequencies
+
+
+ALPHA_SENSITIVITY_GRID = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+
+def run_alpha_sensitivity_sweep(project_name, code_dir, alpha_grid=ALPHA_SENSITIVITY_GRID):
+    """Rebuild edge weights and propagation for every alpha in alpha_grid.
+
+    Saves propagation_frequencies_alpha_<a>.pkl per alpha (used by script 4's ML sensitivity
+    analysis), a distribution summary CSV, and a Spearman rank-stability CSV.
+    """
+    project_dir = os.path.join(EXPORT_DIR, project_name)
+    os.makedirs(project_dir, exist_ok=True)
+
+    logger.info(f"[{project_name}] Building base dependency graph (structural weights only, alpha-independent)...")
+    with git_snapshot_at(code_dir, get_cutoff(project_name)):
+        base_graph = build_ccn(code_dir, project_name)
+    if base_graph is None or base_graph.number_of_nodes() == 0:
+        logger.error(f"[{project_name}] Graph construction failed; cannot run alpha sensitivity sweep.")
+        return None
+    cochange_counts = load_cochange_counts(project_dir)
+
+    rows = []
+    for alpha in alpha_grid:
+        logger.info(f"[{project_name}] alpha={alpha}: combining weights and simulating propagation...")
+        graph_copy = base_graph.copy()
+        graph_copy = combine_structural_and_behavioral_weights(graph_copy, cochange_counts, alpha=alpha)
+        propagation = simulate_change_propagation(graph_copy, base_simulations=20000, factor=5, seed=42)
+
+        # PageRank is the only network feature that uses the edge weights, which depend on alpha: store the weighted
+        # PageRank of this alpha so that 5-MLPipeline.py can recompute the network view inside its alpha sweep.
+        try:
+            pr_alpha = nx.pagerank(graph_copy, max_iter=1000, tol=1e-08)
+            with open(os.path.join(project_dir, f"pagerank_alpha_{alpha:.1f}.pkl"), "wb") as f_pr:
+                pickle.dump(dict(pr_alpha), f_pr)
+        except Exception as e_pr:
+            logger.warning(f"[{project_name}] alpha={alpha}: weighted PageRank not saved: {e_pr}")
+
+        prop_file = os.path.join(project_dir, f"propagation_frequencies_alpha_{alpha:.1f}.pkl")
+        with open(prop_file, "wb") as f:
+            pickle.dump(dict(propagation), f)
+
+        arr = np.asarray(list(propagation.values()), dtype=float)
+        if arr.size > 0:
+            rows.append({
+                'alpha': alpha, 'n_nodes': arr.size,
+                'mean': arr.mean(), 'median': float(np.median(arr)),
+                'p95': float(np.percentile(arr, 95)), 'max': arr.max(),
+                'std': arr.std(), 'cv': (arr.std() / arr.mean()) if arr.mean() > 0 else np.nan,
+            })
+
+    dist_df = pd.DataFrame(rows)
+    csv_path = os.path.join(project_dir, "alpha_sensitivity_propagation_distribution.csv")
+    dist_df.to_csv(csv_path, index=False)
+    logger.info(f"[{project_name}] Alpha sensitivity propagation distribution saved to '{csv_path}'")
+
+    # Rank stability: Spearman correlation of each alpha's ranking vs the reference alpha (0.6)
+    try:
+        from scipy.stats import spearmanr
+        ref_alpha = 0.6 if 0.6 in alpha_grid else alpha_grid[len(alpha_grid) // 2]
+        ref_file = os.path.join(project_dir, f"propagation_frequencies_alpha_{ref_alpha:.1f}.pkl")
+        with open(ref_file, "rb") as f:
+            ref_propagation = pickle.load(f)
+        stability_rows = []
+        for alpha in alpha_grid:
+            prop_file = os.path.join(project_dir, f"propagation_frequencies_alpha_{alpha:.1f}.pkl")
+            with open(prop_file, "rb") as f:
+                prop = pickle.load(f)
+            common = sorted(set(prop.keys()) & set(ref_propagation.keys()))
+            if len(common) > 2:
+                rho, _ = spearmanr([prop[c] for c in common], [ref_propagation[c] for c in common])
+            else:
+                rho = np.nan
+            stability_rows.append({'alpha': alpha, f'spearman_rho_vs_alpha_{ref_alpha:.1f}': rho})
+        stability_df = pd.DataFrame(stability_rows)
+        stability_csv = os.path.join(project_dir, "alpha_sensitivity_ranking_stability.csv")
+        stability_df.to_csv(stability_csv, index=False)
+        logger.info(f"[{project_name}] Alpha ranking-stability (vs alpha={ref_alpha}) saved to '{stability_csv}'")
+    except Exception as e:
+        logger.warning(f"[{project_name}] Could not compute alpha ranking-stability: {e}")
+
+    return dist_df
+
+
+def process_project(project_name, code_dir):
+    """Run graph build, weight combination and propagation simulation for one project.
+
+    Returns True on success, False if the project was skipped or failed.
+    """
+    project_dir = os.path.join(EXPORT_DIR, project_name)
+    os.makedirs(project_dir, exist_ok=True)
+    graph_file = os.path.join(project_dir, "dependency_graph.pkl")
+    propagation_file = os.path.join(project_dir, "propagation_frequencies.pkl")
+
+    if not os.path.isdir(code_dir):
+        logger.error(f"Code directory not found for project '{project_name}': '{code_dir}'. Skipping this project.")
+        return False
+
+    logger.info("Building dependency graph with javalang...")
+    cutoff = get_cutoff(project_name)  # raises if no cutoff is configured
+    snap = git_snapshot_at(code_dir, cutoff)
+    with snap:
+        graph = build_ccn(code_dir, project_name)
+    if graph is None or graph.number_of_nodes() == 0:
+        logger.error(f"Graph construction failed or graph is empty for project '{project_name}'. Skipping.")
+        return False
+
+    logger.info("Loading real co-change data to calibrate edge weights...")
+    cochange_counts = load_cochange_counts(project_dir)
+    graph = combine_structural_and_behavioral_weights(graph, cochange_counts, alpha=ALPHA_STRUCTURAL)
+
+    write_cutoff_marker(project_dir, "graph", cutoff, snap.commit_hash)
+    with open(graph_file, "wb") as f: pickle.dump(graph, f)
+    logger.info(f"Graph saved to '{graph_file}'")
+    logger.info("Starting change propagation simulation...")
+    propagation_results = simulate_change_propagation(graph)
+    if propagation_results:
+        with open(propagation_file, "wb") as f: pickle.dump(dict(propagation_results), f)
+        logger.info(f"Simulation results (frequencies) saved to '{propagation_file}'")
+        return True
+    else:
+        logger.warning(f"Simulation yielded no results for project '{project_name}'. File not saved.")
+        return False
+
+
+def main():
+    """Run process_project() for every project in PROJECTS (a failure is logged and skipped).
+
+    If RUN_ALPHA_SENSITIVITY is True, also runs the alpha sweep for each successful project.
+    """
+    results = {}
+    for project_name in PROJECTS:
+        code_dir = os.path.join(BASE_CODE_DIR, project_name)
+        logger.info("=" * 70)
+        logger.info(f"Starting CCN + propagation pipeline for project: {project_name}")
+        logger.info(f"Code dir: {code_dir}")
+        try:
+            success = process_project(project_name, code_dir)
+        except Exception as e:
+            logger.error(f"Unhandled error while processing project '{project_name}': {e}")
+            success = False
+        results[project_name] = success
+
+        if RUN_ALPHA_SENSITIVITY and success:
+            try:
+                run_alpha_sensitivity_sweep(project_name, code_dir)
+            except Exception as e:
+                logger.error(f"Alpha sensitivity sweep failed for '{project_name}': {e}")
+
+    logger.info("=" * 70)
+    logger.info("Batch run summary:")
+    for project_name, success in results.items():
+        status = "OK" if success else "FAILED/SKIPPED"
+        logger.info(f"  - {project_name}: {status}")
+    logger.info("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+

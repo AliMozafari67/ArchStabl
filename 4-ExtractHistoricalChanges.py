@@ -1,0 +1,406 @@
+import os
+import subprocess
+import git
+import pandas as pd
+from collections import defaultdict
+from tqdm import tqdm
+import logging
+import pickle
+import json
+import re
+import matplotlib.pyplot as plt
+
+from temporal_config import get_cutoff, resolve_cutoff_commit, write_cutoff_marker
+
+# ====================== Settings ======================
+BASE_CODE_DIR = r"D:\proje\python\Payannameh\Source"
+PROJECTS = ["spring-framework", "elasticsearch", "hadoop"]
+
+SINCE_DATE = None  # e.g. "2018-01-01", or None for the entire history
+
+# The temporal cutoff lives in temporal_config.py (shared with script 1).
+# "before" window = commits reachable from the anchor commit (context feature);
+# "after" window = anchor..HEAD (prediction target).
+
+QUANTILE_THRESHOLD = 0.80  # top 20% of change counts = unstable (used for the chart/report)
+# ======================================================
+
+EXPORT_DIR = "ExportFiles"
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+def ensure_git_safe_directory(code_dir):
+    """Register code_dir (and a '*' wildcard fallback) as git safe.directory to avoid 'dubious ownership' errors."""
+    entries_to_try = [code_dir, code_dir.replace("\\", "/"), "*"]
+    for entry in entries_to_try:
+        try:
+            subprocess.run(
+                ["git", "config", "--global", "--add", "safe.directory", entry],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            logger.info(f"Registered safe.directory entry: '{entry}'")
+        except FileNotFoundError:
+            logger.error("Git executable not found. Make sure Git is installed and on PATH.")
+            return
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Could not set safe.directory ('{entry}'): {e.stderr}")
+
+
+def get_class_name_from_relpath(rel_path):
+    """Convert a git-reported ('/'-separated, repo-relative) Java path to a fully-qualified class name."""
+    if not rel_path.endswith(".java"):
+        return None
+    return rel_path.replace("/", ".")[:-5]
+
+
+def _open_repo(code_dir):
+    """Open the repo after registering it as a safe.directory, with one retry."""
+    ensure_git_safe_directory(code_dir)
+    try:
+        repo = git.Repo(code_dir)
+        assert not repo.bare
+        return repo
+    except Exception as e:
+        if "dubious ownership" in str(e).lower():
+            logger.warning("Dubious ownership error detected — retrying after safe.directory fix...")
+            ensure_git_safe_directory(code_dir)
+            try:
+                repo = git.Repo(code_dir)
+                assert not repo.bare
+                return repo
+            except Exception as e2:
+                logger.error(f"Error opening Git repository even after retry: {e2}")
+                logger.error("Did you clone the project with git? Does the .git folder exist?")
+                return None
+        else:
+            logger.error(f"Error opening Git repository: {e}")
+            logger.error("Did you clone the project with git? Does the .git folder exist?")
+            return None
+
+
+def _build_rename_resolution_map(rename_pairs):
+    """Return resolve(path), mapping an old path to its final path (same logic as the co-change script)."""
+    direct_map = dict(rename_pairs)
+
+    def resolve(path, _seen=None):
+        _seen = _seen or set()
+        steps = 0
+        while path in direct_map and path not in _seen and steps < 100:
+            _seen.add(path)
+            path = direct_map[path]
+            steps += 1
+        return path
+
+    return resolve
+
+
+MAX_FILES_PER_COMMIT = 30  # same threshold as the co-change script (1-CoChange.py)
+
+
+def extract_historical_changes(code_dir, since=SINCE_DATE, until=None, diff_all_parents=False, rev_range=None,
+                               max_files_per_commit=None):
+    """Count, per Java class, how many commits touched it within the given window.
+
+    - Merge commits are excluded (--no-merges), same policy as the co-change script;
+      diff_all_parents=True switches to '-m' for debugging.
+    - Renames are detected (-M --name-status) and resolved to the final path.
+    - Windows are defined by commit ancestry via `rev_range` (e.g. "<anchor>" or "<anchor>..HEAD").
+    - A single `git log` call is used for the whole window.
+    - max_files_per_commit (sensitivity analysis only): commits touching more Java files than this are not counted,
+      mirroring the filter of the co-change extraction; None (default) counts every non-merge commit.
+    """
+    logger.info("Opening the Git repository...")
+    repo = _open_repo(code_dir)
+    if repo is None:
+        return {}
+
+    cmd = ["git", "-C", code_dir, "log", "-M", "--name-status", "--pretty=format:%x00%H"]
+    if diff_all_parents:
+        cmd.insert(4, "-m")
+    else:
+        cmd.insert(4, "--no-merges")
+    if since:
+        cmd.append(f"--since={since}")
+    if until:
+        cmd.append(f"--until={until}")
+    if rev_range:
+        cmd.append(rev_range)
+    cmd += ["--", "*.java"]
+
+    logger.info(f"Running: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"git log failed: {e.stderr}")
+        return {}
+
+    # Output format: \x00<hash>\n\n<status>\t<file>\n...
+    chunks = result.stdout.split("\x00")
+    commit_hashes_seen = set()
+
+    # --- Pass 1: collect rename pairs across the window ---
+    rename_pairs = []
+    unparseable_status_lines = 0
+    for chunk in chunks:
+        if not chunk.strip():
+            continue
+        for line in chunk.splitlines()[1:]:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            status = parts[0]
+            if status.startswith("R") or status.startswith("C"):
+                if len(parts) == 3:
+                    if status.startswith("R"):
+                        rename_pairs.append((parts[1], parts[2]))
+                else:
+                    unparseable_status_lines += 1
+
+    resolve_fqn_path = _build_rename_resolution_map(rename_pairs)
+    if rename_pairs:
+        logger.info(f"Detected {len(rename_pairs)} rename events in this window; historical activity "
+                    f"will be attributed to each file's final/current path (Stage-3 rename-tracking fix).")
+
+    # --- Pass 2: count changes using rename-resolved identities ---
+    class_change_count = defaultdict(int)
+    unresolved_class_name_paths = 0
+    skipped_mass_commits = 0
+
+    logger.info("Parsing git log output to extract class changes...")
+    for chunk in tqdm(chunks, desc="Processing commits", unit="commit"):
+        if not chunk.strip():
+            continue
+        lines = chunk.splitlines()
+        if not lines:
+            continue
+        commit_hash = lines[0].strip()
+        if commit_hash:
+            commit_hashes_seen.add(commit_hash)
+        if max_files_per_commit is not None:
+            n_java = sum(1 for ln_ in lines[1:] if ln_.strip().split("\t")[-1].endswith(".java"))
+            if n_java > max_files_per_commit:
+                skipped_mass_commits += 1
+                continue
+        for line in lines[1:]:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            status = parts[0]
+            if status.startswith("R") or status.startswith("C"):
+                path = parts[2] if len(parts) == 3 else None
+            else:
+                path = parts[1] if len(parts) == 2 else None
+            if not path or not path.endswith(".java"):
+                continue
+            resolved_path = resolve_fqn_path(path)
+            class_name = get_class_name_from_relpath(resolved_path)
+            if class_name:
+                class_change_count[class_name] += 1
+            else:
+                unresolved_class_name_paths += 1
+
+    logger.info(f"Number of commits examined: {len(commit_hashes_seen)} (from {since or 'the beginning of the project'})")
+    logger.info(f"Extraction completed. Number of changed classes: {len(class_change_count)}")
+
+    # Save parsing statistics for per-project reporting
+    parsing_stats = {
+        'window_since': since, 'window_until': until, 'rev_range': rev_range,
+        'commits_examined': len(commit_hashes_seen),
+        'rename_events_detected': len(rename_pairs),
+        'unresolved_status_lines': unparseable_status_lines,
+        'paths_that_failed_fqn_conversion': unresolved_class_name_paths,
+        'unique_classes_with_changes': len(class_change_count),
+        'max_files_per_commit': max_files_per_commit, 'mass_commits_skipped': skipped_mass_commits,
+    }
+    try:
+        project_dir_for_stats = os.path.join(EXPORT_DIR, os.path.basename(os.path.normpath(code_dir)))
+        os.makedirs(project_dir_for_stats, exist_ok=True)
+        suffix = ("whole" if not (since or until or rev_range)
+                  else re.sub(r"[^A-Za-z0-9_=.-]", "-", f"since={since}_until={until}_rev={rev_range}"))
+        if max_files_per_commit is not None:
+            suffix += f"_maxfiles{max_files_per_commit}"
+        with open(os.path.join(project_dir_for_stats, f"parsing_stats_historical_changes_{suffix}.pkl"), "wb") as f:
+            pickle.dump(parsing_stats, f)
+    except Exception as e:
+        logger.warning(f"Could not save historical-changes parsing stats: {e}")
+
+    return dict(class_change_count)
+
+
+def plot_distribution(change_counts, project_name, histogram_output):
+    df = pd.DataFrame(list(change_counts.items()), columns=["class_name", "change_count"])
+    df = df[df["change_count"] > 0].sort_values("change_count", ascending=False)
+
+    plt.figure(figsize=(12, 8))
+    plt.hist(df["change_count"], bins=100, color='skyblue', edgecolor='black', alpha=0.7, log=True)
+    threshold = df["change_count"].quantile(QUANTILE_THRESHOLD)
+    plt.axvline(threshold, color='red', linestyle='--', linewidth=2, label=f'Threshold {QUANTILE_THRESHOLD*100:.0f}%= {threshold:.0f} changes')
+    plt.title(f'Distribution of historical class changes - Project {project_name}\n(logarithmic scale)', fontsize=14)
+    plt.xlabel('Number of changes throughout the project history')
+    plt.ylabel('Number of classes (logarithmic scale)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(histogram_output, dpi=300)
+    plt.close()
+    logger.info(f"Distribution chart saved: {histogram_output}")
+
+
+def _save_changes(changes, project_dir, project_name, csv_name, pkl_name, histogram_name, label):
+    """Save change counts (CSV, pkl, histogram) and log a summary for one window."""
+    if not changes:
+        logger.warning(f"[{project_name}] No changes found for window '{label}'.")
+        return None
+    csv_output = os.path.join(project_dir, csv_name)
+    pkl_output = os.path.join(project_dir, pkl_name)
+    histogram_output = os.path.join(project_dir, histogram_name)
+
+    df = pd.DataFrame(list(changes.items()), columns=["class_name", "change_count"])
+    df = df.sort_values("change_count", ascending=False)
+    df.to_csv(csv_output, index=False, encoding="utf-8-sig")
+    with open(pkl_output, "wb") as f:
+        pickle.dump(changes, f)
+    plot_distribution(changes, f"{project_name} [{label}]", histogram_output)
+
+    threshold = df["change_count"].quantile(QUANTILE_THRESHOLD)
+    unstable_count = len(df[df["change_count"] >= threshold])
+    logger.info(f"[{label}] Results saved: {csv_output} / {pkl_output}")
+    logger.info(f"[{label}] Instability threshold ({QUANTILE_THRESHOLD*100:.0f}%): {threshold:.1f} changes")
+    logger.info(f"[{label}] Unstable classes: {unstable_count} ({unstable_count/len(df)*100:.1f}%)")
+    logger.info(f"[{label}] Most frequently changed class: {df.iloc[0]['class_name']} -> {df.iloc[0]['change_count']} changes")
+    return df
+
+
+def _git_one(code_dir, *args):
+    try:
+        return subprocess.run(["git", "-C", code_dir, *args], capture_output=True, text=True, check=True).stdout.strip()
+    except Exception:
+        return None
+
+
+def write_snapshot_population(project_name, project_dir, code_dir, changes_after, anchor=None):
+    """Classify the snapshot (anchor) classes by what happened to them after the anchor.
+
+    Uses the class list of code_metrics.pkl (script 3) and the Java files in the tree of HEAD (`git ls-tree`),
+    where HEAD is the same revision that closes the target window (anchor..HEAD). Writes
+    snapshot_population_<project>.json with counts and two class lists used by 5-MLPipeline.py:
+      changed_present_at_head   - in the snapshot, still at HEAD, changed after the anchor (= modelling population
+                                  when all feature sources exist)
+      unchanged_present_at_head - in the snapshot, still at HEAD, never changed (true 'change count 0')
+      absent_at_head            - in the snapshot but not at HEAD under the same path (deleted, moved or renamed:
+                                  their 0 would be a tracking artefact, so they are never labelled 'stable')
+      new_changed_not_in_snapshot - changed after the anchor but not in the snapshot (new or renamed classes)
+    """
+    metrics_path = os.path.join(project_dir, "code_metrics.pkl")
+    if not os.path.exists(metrics_path):
+        logger.warning(f"[{project_name}] code_metrics.pkl not found - snapshot population not written "
+                       f"(run script 3 before script 4).")
+        return None
+    with open(metrics_path, "rb") as f:
+        snapshot = set(pickle.load(f).keys())
+    try:
+        res = subprocess.run(["git", "-C", code_dir, "ls-tree", "-r", "-z", "--name-only", "HEAD"],
+                             capture_output=True, check=True)
+    except Exception as e:
+        logger.error(f"[{project_name}] git ls-tree HEAD failed: {e}")
+        return None
+    paths = res.stdout.decode("utf-8", errors="replace").split("\0")
+    head_classes = {c for c in (get_class_name_from_relpath(p) for p in paths) if c}
+    changed = set(dict(changes_after).keys())
+    out = {
+        "snapshot_classes_with_metrics": len(snapshot),
+        "java_classes_at_head": len(head_classes),
+        "changed_present_at_head": sorted(snapshot & head_classes & changed),
+        "unchanged_present_at_head": sorted((snapshot & head_classes) - changed),
+        "absent_at_head": sorted(snapshot - head_classes),
+        "new_changed_not_in_snapshot": sorted(changed - snapshot),
+        # revisions that close and open the target window (needed to reproduce the extraction)
+        "head_commit": _git_one(code_dir, "rev-parse", "HEAD"),
+        "head_commit_date": _git_one(code_dir, "show", "-s", "--format=%cI", "HEAD"),
+        "anchor_commit": anchor,
+        "anchor_commit_date": _git_one(code_dir, "show", "-s", "--format=%cI", anchor) if anchor else None,
+        "n_noMerge_commits_anchor_to_head": _git_one(code_dir, "rev-list", "--no-merges", "--count", f"{anchor}..HEAD") if anchor else None,
+    }
+    summary = {k: (len(v) if isinstance(v, list) else v) for k, v in out.items()}
+    # counts are stored under 'n_*' keys; the lists keep their names
+    counts = {f"n_{k}": n for k, n in summary.items() if isinstance(out[k], list)}
+    out.update(counts)
+    with open(os.path.join(project_dir, f"snapshot_population_{project_name}.json"), "w", encoding="utf-8") as f:
+        json.dump(out, f)
+    logger.info(f"[{project_name}] snapshot population: {json.dumps({k: v for k, v in out.items() if not isinstance(v, list)})}")
+    return out
+
+
+def process_project(project_name, code_dir):
+    """Extract and save change counts for one project.
+
+    Produces the whole-history file (diagnostics only) plus, when a cutoff is set,
+    class_change_frequency_before.pkl (context feature) and
+    class_change_frequency_after.pkl (prediction target).
+    """
+    logger.info(f"Starting historical change extraction for project: {project_name}")
+
+    project_dir = os.path.join(EXPORT_DIR, project_name)
+    os.makedirs(project_dir, exist_ok=True)
+
+    changes = extract_historical_changes(code_dir, SINCE_DATE)
+    _save_changes(changes, project_dir, project_name,
+                 "historical_class_changes.csv", "class_change_frequency.pkl",
+                 "historical_changes_distribution.png", "whole-history (legacy)")
+
+    cutoff = get_cutoff(project_name)  # raises if no cutoff is configured
+    anchor = None
+    if cutoff:
+        anchor = resolve_cutoff_commit(code_dir, cutoff)
+        if not anchor:
+            raise RuntimeError(f"[{project_name}] No commit at or before cutoff {cutoff}.")
+        logger.info(f"Cutoff {cutoff} -> anchor commit {anchor}: 'before' = commits reachable from the "
+                    f"anchor, 'after' (TARGET) = {anchor}..HEAD. The windows are disjoint.")
+        changes_before = extract_historical_changes(code_dir, since=SINCE_DATE, rev_range=anchor)
+        _save_changes(changes_before, project_dir, project_name,
+                     "historical_class_changes_before.csv", "class_change_frequency_before.pkl",
+                     "historical_changes_distribution_before.png", "before-cutoff (context feature)")
+        changes_after = extract_historical_changes(code_dir, since=SINCE_DATE, rev_range=f"{anchor}..HEAD")
+        _save_changes(changes_after, project_dir, project_name,
+                     "historical_class_changes_after.csv", "class_change_frequency_after.pkl",
+                     "historical_changes_distribution_after.png", "after-cutoff (PREDICTION TARGET)")
+        # Sensitivity analysis: target counted without mass commits (> MAX_FILES_PER_COMMIT Java files), as in the
+        # co-change extraction; used by 5-MLPipeline.py (population_nomass analysis).
+        changes_after_nomass = extract_historical_changes(code_dir, since=SINCE_DATE, rev_range=f"{anchor}..HEAD",
+                                                          max_files_per_commit=MAX_FILES_PER_COMMIT)
+        if changes_after_nomass:
+            with open(os.path.join(project_dir, "class_change_frequency_after_nomass.pkl"), "wb") as f:
+                pickle.dump(changes_after_nomass, f)
+        try:
+            write_snapshot_population(project_name, project_dir, code_dir, changes_after, anchor=anchor)
+        except Exception as e:
+            logger.error(f"[{project_name}] snapshot population analysis failed: {e}")
+    else:
+        logger.warning("No cutoff (ALLOW_WHOLE_HISTORY=True): whole-history target = LEAKY configuration.")
+
+    marker_path = write_cutoff_marker(project_dir, "historical", cutoff, anchor)
+    logger.info(f"Cutoff marker written to '{marker_path}' (temporal_cutoff_date={cutoff!r}, anchor={anchor}); "
+                f"4-MLPipeline.py checks it against the markers of scripts 0, 1 and 2.")
+
+
+def main():
+    for project_name in PROJECTS:
+        code_dir = os.path.join(BASE_CODE_DIR, project_name)
+        logger.info(f"\n{'=' * 80}\nProcessing project: {project_name}\n{'=' * 80}")
+        process_project(project_name, code_dir)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
